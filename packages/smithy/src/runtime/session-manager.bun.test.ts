@@ -1164,6 +1164,41 @@ describe('SessionManager', () => {
   });
 
   describe('persistSession with history', () => {
+    test('does not resurrect a session that exits during persistence', async () => {
+      const { session } = await sessionManager.startSession(testAgentId);
+      const originalGet = registry.getAgent.bind(registry);
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => { release = resolve; });
+      let firstRead = true;
+      registry.getAgent = async (id) => {
+        const agent = await originalGet(id);
+        if (firstRead) {
+          firstRead = false;
+          await blocked;
+        }
+        return agent;
+      };
+
+      const persistence = sessionManager.persistSession(session.id);
+      await sessionManager.stopSession(session.id);
+      release();
+      await persistence;
+      expect(sessionManager.getSession(session.id)?.status).toBe('terminated');
+      const agent = await registry.getAgent(testAgentId);
+      expect((agent?.metadata?.agent as AgentMetadata).sessionStatus).toBe('idle');
+    });
+
+    test('notifies exit listeners when liveness cleanup discovers a missed exit', async () => {
+      const { session, events } = await sessionManager.startSession(testAgentId);
+      let exits = 0;
+      events.once('exit', () => { exits++; });
+      spawner._mockSessions.delete(session.id);
+
+      expect(sessionManager.getActiveSession(testAgentId)).toBeUndefined();
+      expect(sessionManager.getActiveSession(testAgentId)).toBeUndefined();
+      expect(exits).toBe(1);
+    });
+
     test('persists session history to agent metadata', async () => {
       const { session } = await sessionManager.startSession(testAgentId);
       await sessionManager.stopSession(session.id);

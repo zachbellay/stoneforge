@@ -184,10 +184,11 @@ async function daemonStopHandler(
     return failure(`Failed to check daemon status: ${statusResult.error}`, ExitCode.GENERAL_ERROR);
   }
 
-  const statusData = statusResult.data as { running?: boolean; status?: string };
+  const statusData = statusResult.data as { isRunning?: boolean; running?: boolean; status?: string };
 
   // If daemon is not running, nothing to stop
-  if (!statusData.running && statusData.status !== 'running') {
+  const isRunning = statusData.isRunning ?? statusData.running ?? (statusData.status === 'running');
+  if (!isRunning) {
     const mode = getOutputMode(options);
     if (mode === 'json') {
       return success({ status: 'not_running', message: 'Daemon is not running' });

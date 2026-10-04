@@ -612,7 +612,7 @@ export class SessionManagerImpl implements SessionManager {
     this.operationLog?.write('info', 'session', `Session started for agent ${agentId} (${meta.agentRole})`, { agentId, sessionId: sessionState.id });
 
     return {
-      session: this.toPublicSession(sessionState),
+      session: this.getSession(sessionState.id) ?? this.toPublicSession(sessionState),
       events: sessionState.events,
     };
   }
@@ -734,7 +734,7 @@ export class SessionManagerImpl implements SessionManager {
     await this.persistSession(sessionState.id);
 
     return {
-      session: this.toPublicSession(sessionState),
+      session: this.getSession(sessionState.id) ?? this.toPublicSession(sessionState),
       events: sessionState.events,
       uwpCheck,
     };
@@ -1179,6 +1179,13 @@ export class SessionManagerImpl implements SessionManager {
       sessionHistory: inMemoryHistory.slice(0, 20),
     } as Record<string, unknown>);
 
+    // An exit or suspension can replace this snapshot while registry writes
+    // are awaiting. Persist the current state rather than resurrecting it.
+    if (this.sessions.get(sessionId) !== session) {
+      await this.persistSession(sessionId);
+      return;
+    }
+
     // Mark as persisted
     const updatedSession: InternalSessionState = {
       ...session,
@@ -1401,6 +1408,9 @@ export class SessionManagerImpl implements SessionManager {
       this.agentSessions.delete(session.agentId);
     }
     this.addToHistory(session.agentId, updated);
+    // A missed provider exit still needs to notify lifecycle consumers,
+    // including triage inbox acknowledgement and worktree cleanup.
+    updated.events.emit('exit', null, null);
     this.registry.updateAgentSession(session.agentId, undefined, 'idle').catch(() => {});
     this.persistSession(session.id).then(() => {
       this.scheduleTerminatedSessionCleanup(session.id);
@@ -1594,6 +1604,7 @@ export class SessionManagerImpl implements SessionManager {
       createdAt: result.session.createdAt,
       startedAt: result.session.startedAt,
       lastActivityAt: result.session.lastActivityAt,
+      endedAt: result.session.endedAt,
       events: new EventEmitter(),
       persisted: false,
     };

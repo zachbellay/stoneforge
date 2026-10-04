@@ -13,6 +13,8 @@
 import { describe, test, expect, beforeEach, afterEach, mock } from 'bun:test';
 import * as fs from 'fs';
 import { EventEmitter } from 'node:events';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createStorage, initializeSchema } from '@stoneforge/storage';
 import { createQuarryAPI, type QuarryAPI, type InboxService, createInboxService } from '@stoneforge/quarry';
 import {
@@ -525,6 +527,72 @@ describe('recoverOrphanedAssignments', () => {
         checkReadyQueue: false,
       })
     );
+  });
+
+  test('does not resume a task completed while its worktree is being checked', async () => {
+    const worker = await createTestWorker('completed-during-recovery');
+    const workerId = worker.id as unknown as EntityId;
+    const task = await createAssignedTask('Completed task', workerId, { sessionId: 'old-session' });
+    (worktreeManager.worktreeExists as ReturnType<typeof mock>).mockImplementation(async () => {
+      await api.update(task.id, { status: TaskStatus.CLOSED });
+      return true;
+    });
+
+    await daemon.recoverOrphanedAssignments();
+    expect(sessionManager.resumeSession).not.toHaveBeenCalled();
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+
+  test('dispatches a CLI-style assignment without session metadata once and skips it after completion', async () => {
+    const worker = await createTestWorker('cli-assigned-worker');
+    const workerId = worker.id as unknown as EntityId;
+    const task = await createAssignedTask('Actual assigned implementation', workerId);
+
+    await daemon.recoverOrphanedAssignments();
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    const [, options] = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls[0];
+    expect(options.initialPrompt).toContain(task.id);
+    expect(options.initialPrompt).toContain(task.title);
+    expect(options.initialPrompt).not.toContain('spawned as a **triage session**');
+
+    await daemon.recoverOrphanedAssignments();
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    await api.update(task.id, { status: TaskStatus.CLOSED });
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockReturnValue(undefined);
+    await daemon.recoverOrphanedAssignments();
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    expect(sessionManager.resumeSession).not.toHaveBeenCalled();
+  });
+
+  const builtCli = fileURLToPath(new URL('../../dist/bin/sf.js', import.meta.url));
+  test.skipIf(!fs.existsSync(builtCli))('sees task creation and completion by a separate Node CLI process', async () => {
+    const worker = await createTestWorker('node-cli-worker');
+    const runCli = (args: string[]) => {
+      const result = spawnSync('node', [builtCli, ...args, '--db', testDbPath, '--actor', systemEntity, '--json'], {
+        encoding: 'utf8', env: { ...process.env, SF_ENTITY_ID: systemEntity },
+      });
+      expect(result.status).toBe(0);
+      const response = JSON.parse(result.stdout);
+      expect(response.success).toBe(true);
+      return response.data;
+    };
+    const task = runCli(['task', 'create', '--title', 'Node CLI assigned implementation',
+      '--assignee', worker.id, '--no-auto-link']);
+    expect((await api.get<Task>(task.id))?.assignee).toBe(worker.id);
+
+    await daemon.recoverOrphanedAssignments();
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    const [, options] = (sessionManager.startSession as ReturnType<typeof mock>).mock.calls[0];
+    expect(options.initialPrompt).toContain(task.id);
+    expect(options.initialPrompt).toContain('Node CLI assigned implementation');
+
+    runCli(['task', 'complete', task.id, '--no-mr']);
+    expect((await api.get<Task>(task.id))?.status).toBe(TaskStatus.REVIEW);
+    (sessionManager.getActiveSession as ReturnType<typeof mock>).mockReturnValue(undefined);
+    await daemon.recoverOrphanedAssignments();
+    await daemon.recoverOrphanedAssignments();
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    expect(sessionManager.resumeSession).not.toHaveBeenCalled();
   });
 
   test('skips worker with active session', async () => {
@@ -5090,6 +5158,62 @@ describe('spawnTriageSession - rate limit guard', () => {
 
     // startSession SHOULD have been called (triage was spawned)
     expect(startSessionMock.mock.calls.length).toBeGreaterThan(callCountBefore);
+  });
+
+  test('does not triage an item handled after the unread poll snapshot', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'handled-after-poll', workerMode: 'ephemeral', createdBy: systemEntity,
+    });
+    const workerId = worker.id as unknown as EntityId;
+    await createTestMessageAndInboxItem(workerId, 'handled');
+    const originalGet = api.get.bind(api);
+    api.get = async (...args) => {
+      const result = await originalGet(...args);
+      if (result?.type === 'message') inboxService.markAllAsRead(workerId);
+      return result;
+    };
+
+    await daemon.pollInboxes();
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
+  });
+
+  test('acknowledges triage whose exit occurred before startSession returned', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'fast-triage', workerMode: 'ephemeral', createdBy: systemEntity,
+    });
+    const workerId = worker.id as unknown as EntityId;
+    await createTestMessageAndInboxItem(workerId, 'fast');
+    const events = new EventEmitter();
+    (sessionManager.startSession as ReturnType<typeof mock>).mockImplementation(async (agentId: EntityId) => {
+      events.emit('exit', 0, null);
+      return { session: { id: 'finished-triage', agentId, status: 'terminated' }, events };
+    });
+
+    await daemon.pollInboxes();
+    await daemon.pollInboxes();
+    expect(sessionManager.startSession).toHaveBeenCalledTimes(1);
+    expect(inboxService.getUnreadCount(workerId)).toBe(0);
+    expect(worktreeManager.removeWorktree).toHaveBeenCalledTimes(1);
+  });
+
+  const builtCli = fileURLToPath(new URL('../../dist/bin/sf.js', import.meta.url));
+  test.skipIf(!fs.existsSync(builtCli))('sees inbox read by a separate Node CLI process', async () => {
+    const worker = await agentRegistry.registerWorker({
+      name: 'node-cli-inbox', workerMode: 'ephemeral', createdBy: systemEntity,
+    });
+    const workerId = worker.id as unknown as EntityId;
+    await createTestMessageAndInboxItem(workerId, 'node-cli');
+    const item = inboxService.getInbox(workerId)[0];
+    const result = spawnSync('node', [builtCli, 'inbox', 'read', item.id,
+      '--db', testDbPath, '--actor', systemEntity, '--json'], {
+      encoding: 'utf8', env: { ...process.env, SF_ENTITY_ID: systemEntity },
+    });
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).success).toBe(true);
+    expect(inboxService.getInboxItem(item.id)?.status).toBe('read');
+    await daemon.pollInboxes();
+    await daemon.pollInboxes();
+    expect(sessionManager.startSession).not.toHaveBeenCalled();
   });
 });
 

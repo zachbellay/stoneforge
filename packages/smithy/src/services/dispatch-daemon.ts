@@ -1303,12 +1303,14 @@ export class DispatchDaemonImpl implements DispatchDaemon {
               // isn't prematurely flagged as stuck.
               // Re-read task metadata since recoverOrphanedTask may have updated it (e.g., new sessionId).
               const freshTask = await this.api.get<Task>(taskAssignment.task.id);
-              await this.api.update<Task>(taskAssignment.task.id, {
-                metadata: updateOrchestratorTaskMeta(
-                  freshTask?.metadata as Record<string, unknown> | undefined,
-                  { resumeCount: resumeCount + 1 }
-                ),
-              });
+              if (freshTask && (freshTask.status === TaskStatus.OPEN || freshTask.status === TaskStatus.IN_PROGRESS)) {
+                await this.api.update<Task>(taskAssignment.task.id, {
+                  metadata: updateOrchestratorTaskMeta(
+                    freshTask.metadata as Record<string, unknown> | undefined,
+                    { resumeCount: resumeCount + 1 }
+                  ),
+                });
+              }
               processed++;
             }
           } catch (error) {
@@ -2306,6 +2308,17 @@ export class DispatchDaemonImpl implements DispatchDaemon {
         ),
       });
     }
+
+    // Completion or reassignment through the CLI can happen while resolving
+    // the worktree. Re-read shared storage before starting a paid session.
+    const currentTask = await this.api.get<Task>(task.id);
+    if (!currentTask ||
+      (currentTask.status !== TaskStatus.OPEN && currentTask.status !== TaskStatus.IN_PROGRESS) ||
+      currentTask.assignee !== workerId) {
+      return false;
+    }
+    task = currentTask;
+    taskMeta = getOrchestratorTaskMeta(task.metadata as Record<string, unknown> | undefined);
 
     // 2. Try resume first if we have a previous session ID
     const previousSessionId = taskMeta?.sessionId;
@@ -3913,13 +3926,12 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       const [channelId, channelItems] = byChannel.entries().next().value as [string, InboxItem[]];
 
       try {
-        await this.spawnTriageSession(agent, channelItems, channelId);
+        const spawned = await this.spawnTriageSession(agent, channelItems, channelId);
 
         // Count items as processed only after spawn succeeds. Items are
         // marked as read in spawnTriageSession's exit handler after the
-        // triage session completes. If the session crashes, items stay
-        // unread and retry next cycle.
-        processed += channelItems.length;
+        // triage session exits. A failed spawn leaves them unread.
+        if (spawned) processed += channelItems.length;
       } catch (error) {
         logger.error(
           `Failed to spawn triage session for agent ${agent.name}:`,
@@ -3945,8 +3957,12 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     agent: AgentEntity,
     items: InboxItem[],
     channelId: string
-  ): Promise<void> {
+  ): Promise<boolean> {
     const agentId = asEntityId(agent.id);
+
+    // A CLI or another session may have handled these after the poll read.
+    items = items.filter((item) => this.inboxService.getInboxItem(item.id)?.status === InboxStatus.UNREAD);
+    if (items.length === 0) return false;
 
     // Rate limit guard: skip triage when all executables are rate-limited.
     // Items stay unread and retry next cycle when limits expire.
@@ -3955,7 +3971,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       logger.debug(
         `All executables rate-limited, skipping triage session for ${agent.name}`
       );
-      return;
+      return false;
     }
 
     // Create a read-only worktree (detached HEAD on default branch).
@@ -3995,7 +4011,7 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     const triageItems: Array<{ message: Message; inboxItemId: string }> = [];
     for (const item of items) {
       const message = await this.api.get<Message>(asElementId(item.messageId));
-      if (message) {
+      if (message && this.inboxService.getInboxItem(item.id)?.status === InboxStatus.UNREAD) {
         triageItems.push({ message, inboxItemId: item.id });
       }
     }
@@ -4007,10 +4023,15 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       } catch {
         // Ignore cleanup errors
       }
-      return;
+      return false;
     }
 
     const initialPrompt = await this.buildTriagePrompt(agent, triageItems, channelId);
+
+    if (triageItems.every((item) => this.inboxService.getInboxItem(item.inboxItemId)?.status !== InboxStatus.UNREAD)) {
+      await this.worktreeManager.removeWorktree(worktreeResult.path);
+      return false;
+    }
 
     // Start a headless session in the read-only worktree
     const { session, events } = await this.sessionManager.startSession(agentId, {
@@ -4026,14 +4047,21 @@ export class DispatchDaemonImpl implements DispatchDaemon {
     }
 
     // On session exit: mark triage items as read and clean up worktree.
-    // Items stay unread if the session crashes, so they retry next cycle.
+    // A failed start leaves items unread. Exit acknowledgement also handles
+    // providers whose exit was discovered by session liveness reconciliation.
     // Use .once() since a session only exits once; bump maxListeners to avoid false warning.
     events.setMaxListeners(events.getMaxListeners() + 1);
-    events.once('exit', async () => {
+    let cleanedUp = false;
+    const onExit = async () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      events.off('exit', onExit);
       // Mark triage items as read. Use batch for efficiency.
       // Errors are non-fatal — items stay unread and retry next cycle.
       try {
-        this.inboxService.markAsReadBatch(items.map((item) => item.id));
+        this.inboxService.markAsReadBatch(items
+          .filter((item) => this.inboxService.getInboxItem(item.id)?.status === InboxStatus.UNREAD)
+          .map((item) => item.id));
       } catch (error) {
         logger.warn('Failed to mark triage items as read:', error);
       }
@@ -4043,9 +4071,17 @@ export class DispatchDaemonImpl implements DispatchDaemon {
       } catch {
         // Ignore cleanup errors — worktree may already be removed
       }
-    });
+    };
+    events.once('exit', onExit);
+
+    // startSession awaits registry persistence. A fast provider may exit
+    // during that await, before the exit listener above can be attached.
+    if ((this.sessionManager.getSession(session.id) ?? session).status === 'terminated') {
+      await onExit();
+    }
 
     this.emitter.emit('agent:triage-spawned', agentId, channelId, worktreeResult.path);
+    return true;
   }
 
   /**
