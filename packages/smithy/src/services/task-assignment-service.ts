@@ -577,10 +577,12 @@ export class TaskAssignmentServiceImpl implements TaskAssignmentService {
         sourceBranch: branch,
         targetBranch: baseBranch,
       });
-      mergeRequestUrl = mrResult.url;
-      mergeRequestId = mrResult.id;
-      metaUpdates.mergeRequestUrl = mergeRequestUrl;
-      metaUpdates.mergeRequestId = mergeRequestId;
+      // Keep previously recorded review details when a provider (for example,
+      // the local provider) does not return a remote URL or identifier.
+      mergeRequestUrl = mrResult.url ?? currentMeta?.mergeRequestUrl;
+      mergeRequestId = mrResult.id ?? currentMeta?.mergeRequestId;
+      if (mrResult.url !== undefined) metaUpdates.mergeRequestUrl = mrResult.url;
+      if (mrResult.id !== undefined) metaUpdates.mergeRequestId = mrResult.id;
       metaUpdates.mergeRequestProvider = this.mergeRequestProvider.name;
     }
     // When no provider is configured, skip PR creation but still complete the task.

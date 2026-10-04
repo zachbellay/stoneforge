@@ -37,6 +37,7 @@ import {
   History,
   Eye,
   Shield,
+  ExternalLink,
 } from 'lucide-react';
 import {
   useTask,
@@ -502,6 +503,30 @@ function OrchestratorMetadataSection({ meta, onUpdateMergeStatus, isUpdatingMerg
             <span className="font-mono text-[var(--color-text)]">{meta.branch}</span>
           </div>
         )}
+
+        {/* External review link, when the merge provider returned one */}
+        {meta.mergeRequestUrl ? (
+          <div className="flex items-center gap-2 text-sm">
+            <ExternalLink className="w-4 h-4 text-[var(--color-text-tertiary)]" />
+            <a
+              href={meta.mergeRequestUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-[var(--color-primary)] hover:underline break-all"
+            >
+              {meta.mergeRequestProvider === 'github' ? 'Open GitHub pull request' : 'Open merge request'}
+            </a>
+          </div>
+        ) : meta.mergeRequestProvider || meta.mergeStatus ? (
+          <div className="flex items-center gap-2 text-sm text-[var(--color-text-tertiary)]">
+            <ExternalLink className="w-4 h-4" />
+            <span>
+              {meta.mergeRequestProvider
+                ? `No external review URL was returned by ${meta.mergeRequestProvider}.`
+                : 'No external review URL is available for this task.'}
+            </span>
+          </div>
+        ) : null}
 
         {/* Merge Status */}
         {meta.mergeStatus && (

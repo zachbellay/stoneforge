@@ -324,7 +324,10 @@ async function taskCompleteHandler(
       lines.push(`  Summary: ${options.summary.slice(0, 50)}${options.summary.length > 50 ? '...' : ''}`);
     }
     if (result.mergeRequestUrl) {
-      lines.push(`  MR: ${result.mergeRequestUrl}`);
+      const provider = (result.task.metadata?.orchestrator as { mergeRequestProvider?: string } | undefined)?.mergeRequestProvider;
+      lines.push(`  ${provider === 'github' ? 'GitHub PR' : 'Merge request'}: ${result.mergeRequestUrl}`);
+    } else {
+      lines.push('  GitHub review link: unavailable (no remote URL was returned)');
     }
 
     return success(result, lines.join('\n'));

@@ -1316,9 +1316,9 @@ export class MergeStewardServiceImpl implements MergeStewardService {
       // Store PR info in task metadata
       const metaUpdates: Partial<OrchestratorTaskMeta> = {
         mergeStatus: 'awaiting_approval',
-        mergeRequestUrl: mrResult.url,
-        mergeRequestId: mrResult.id,
         mergeRequestProvider: provider.name,
+        ...(mrResult.url !== undefined ? { mergeRequestUrl: mrResult.url } : {}),
+        ...(mrResult.id !== undefined ? { mergeRequestId: mrResult.id } : {}),
       };
 
       if (testResult) {
